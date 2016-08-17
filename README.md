@@ -29,7 +29,7 @@ Compile:
 ```
 This project is written in C/C++ using Windows API calls, so you need Visual Studio to compile.
 Source code of the needed dll's are included within the project, but not needed to run the tool.
-They are embeded within the main executable (as Base64 encoded and compressed binaries).
+They are embedded within the main executable (as Base64 encoded and compressed binaries).
 ```
 
 ### How to use it:
