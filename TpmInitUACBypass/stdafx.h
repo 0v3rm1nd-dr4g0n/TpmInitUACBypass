@@ -10,7 +10,6 @@
 #include <stdio.h>
 #include <tchar.h>
 #include "WbemComnB64.h"
-#include "IFileOperationB64.h"
 #include "MsfStagerB64.h"
 
 

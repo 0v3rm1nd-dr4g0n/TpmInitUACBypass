@@ -21,9 +21,6 @@
     <ClCompile Include="stdafx.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="IFileOperationB64.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
     <ClCompile Include="MsfStagerB64.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
@@ -39,9 +36,6 @@
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="WbemComnB64.h">
-      <Filter>Header Files</Filter>
-    </ClInclude>
-    <ClInclude Include="IFileOperationB64.h">
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="MsfStagerB64.h">
